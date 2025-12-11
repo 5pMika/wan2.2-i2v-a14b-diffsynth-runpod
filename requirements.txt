@@ -1,0 +1,6 @@
+runpod
+diffsynth
+modelscope
+Pillow
+requests
+boto3

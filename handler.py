@@ -4,7 +4,7 @@ import logging
 import os
 import tempfile
 import uuid
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import requests
 import runpod
@@ -96,6 +96,29 @@ def _load_pipeline() -> WanVideoPipeline:
     return PIPELINE
 
 
+def _as_bool(val: Union[str, bool, None], default: bool = True) -> bool:
+    if val is None:
+        return default
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, str):
+        return val.strip().lower() in {"1", "true", "yes", "on", "y"}
+    return bool(val)
+
+
+def _parse_int(
+    name: str, raw: Union[str, int, float, None], default: int, *, min_value: int, max_value: int
+) -> int:
+    value = raw if raw is not None else default
+    try:
+        int_val = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+    if int_val < min_value or int_val > max_value:
+        raise ValueError(f"{name} must be between {min_value} and {max_value}")
+    return int_val
+
+
 def _decode_base64_image(b64_str: str) -> Image.Image:
     if b64_str.startswith("data:"):
         b64_str = b64_str.split(",", 1)[-1]
@@ -162,39 +185,63 @@ def handler(job):
         return {"error": "image is required (url, base64 or path)"}
 
     negative_prompt = job_input.get("negative_prompt", "")
-    height = int(job_input.get("height", 480))
-    width = int(job_input.get("width", 832))
-    tiled = bool(job_input.get("tiled", True))
-    fps = int(job_input.get("fps", 15))
-    quality = int(job_input.get("quality", 5))
-    seed = int(job_input.get("seed", 1))
+
+    try:
+        height = _parse_int("height", job_input.get("height"), 480, min_value=64, max_value=1536)
+        width = _parse_int("width", job_input.get("width"), 832, min_value=64, max_value=2048)
+        fps = _parse_int("fps", job_input.get("fps"), 15, min_value=1, max_value=60)
+        quality = _parse_int("quality", job_input.get("quality"), 5, min_value=1, max_value=10)
+        seed = int(job_input.get("seed", 1))
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    tiled = _as_bool(job_input.get("tiled", True), default=True)
 
     control_video_path = None
     if job_input.get("control_video"):
-        control_video_path = (
-            _download_to_temp(job_input["control_video"], suffix=".mp4")
-            if job_input["control_video"].startswith("http")
-            else job_input["control_video"]
-        )
+        try:
+            control_video_path = (
+                _download_to_temp(job_input["control_video"], suffix=".mp4")
+                if job_input["control_video"].startswith("http")
+                else job_input["control_video"]
+            )
+            if not os.path.exists(control_video_path):
+                return {"error": "control_video path does not exist after download"}
+        except Exception as exc:
+            return {"error": f"failed to load control_video: {exc}"}
 
-    ref_image = _load_image(image_ref, (width, height))
+    try:
+        ref_image = _load_image(image_ref, (width, height))
+    except requests.RequestException as exc:
+        return {"error": f"failed to fetch image: {exc}"}
+    except Exception as exc:
+        return {"error": f"failed to load image: {exc}"}
+
     control_video = (
         VideoData(control_video_path, height=height, width=width)
         if control_video_path
         else None
     )
 
-    pipe = _load_pipeline()
+    try:
+        pipe = _load_pipeline()
+    except Exception as exc:
+        logger.error("Pipeline load failed: %s", exc)
+        return {"error": f"pipeline load failed: {exc}"}
 
     with torch.inference_mode():
-        video = pipe(
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            vace_reference_image=ref_image,
-            vace_video=control_video,
-            seed=seed,
-            tiled=tiled,
-        )
+        try:
+            video = pipe(
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                vace_reference_image=ref_image,
+                vace_video=control_video,
+                seed=seed,
+                tiled=tiled,
+            )
+        except Exception as exc:
+            logger.error("Generation failed: %s", exc)
+            return {"error": f"generation failed: {exc}"}
 
     output_path = os.path.join(tempfile.gettempdir(), f"{job_id}.mp4")
     save_video(video, output_path, fps=fps, quality=quality)
@@ -209,6 +256,8 @@ def handler(job):
         "seed": seed,
         "fps": fps,
         "tiled": tiled,
+        "height": height,
+        "width": width,
     }
 
 
